@@ -1,0 +1,153 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-binaries:
+    name: Build Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Ensure cross is installed
+        run: |
+          cargo install cross
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          target: ${{ matrix.target }}
+          cache: true
+
+      - name: Build
+        run: cross build --target ${{ matrix.target }} --release
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../redlib-${{ matrix.target }}.tar.gz redlib
+          cd ../../../
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: binaries-${{ matrix.target }}
+          path: |
+            redlib-${{ matrix.target }}.tar.gz
+
+  build-docker:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: [Dockerfile.ubuntu, Dockerfile.alpine]
+        include:
+          - dockerfile: Dockerfile.ubuntu
+            suffix: ""
+            platforms: linux/amd64,linux/arm64,linux/arm/v7
+          - dockerfile: Dockerfile.alpine
+            suffix: "-alpine"
+            platforms: linux/amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq .packages[0].version -r)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest${{ matrix.suffix }},enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}}${{ matrix.suffix }},value=${{ steps.get_version.outputs.VERSION }}
+            type=semver,pattern={{major}}.{{minor}}${{ matrix.suffix }},value=${{ steps.get_version.outputs.VERSION }}
+            type=semver,pattern={{major}}${{ matrix.suffix }},value=${{ steps.get_version.outputs.VERSION }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7.0.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ github.workflow }}-${{ matrix.dockerfile }}
+          cache-to: type=gha,mode=max,scope=${{ github.workflow }}-${{ matrix.dockerfile }}
+
+  release:
+    name: Create Release
+    needs:
+      - build-binaries
+      - build-docker
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binaries-*
+          path: artifacts
+          merge-multiple: true
+
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(cargo metadata --format-version 1 --no-deps | jq .packages[0].version -r)
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "TAG=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG }}
+          name: Release ${{ steps.get_version.outputs.TAG }}
+          draft: false
+          prerelease: false
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
